@@ -1,4 +1,4 @@
-# Predicting-Rent-in-New-York--Kaggle-Competition
+# Predicting-Rent-in-New-York / Kaggle-Competition
 
 # This is the result of a Kaggle class competition
 
