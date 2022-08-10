@@ -1,0 +1,166 @@
+#Load libraries
+library(dplyr)
+library(forcats)
+library(readr)
+
+setwd("C://Data")
+
+#Read the data
+data <- read.csv('analysisData.csv')
+scoringData <- read.csv('scoringData.csv')
+
+
+#Make all missing data in N/A
+char2na <- function(x) {
+  x <- as.character(x)
+  return(
+    case_when(
+      x == "" ~ NA_character_,
+      x == "N/A" ~ NA_character_,
+      TRUE ~ x
+    )
+  )
+}
+
+#Make strings clean by removing white space, comma, etc
+clean_location<-function(x){
+  column<-gsub(",|-|\\n|\\)|\\(|/|\\.", " ", 
+               tolower(x))
+  column <- stringr::str_trim(
+    gsub("\\s+", " ",column))
+  column <- fct_lump_min(column, min=5)
+  return(column)
+}
+
+#Make Dates in integers
+days <- function(x) {
+  x<-as.Date(x)
+  x<-as.numeric(-difftime(x ,as.Date("2021-01-01") , units = c("days")))
+  return(x)}
+
+
+#Combine the data to do the cleaning together for both datasets
+combinedData <- bind_rows(data, scoringData)
+
+#Drop columns based on observation of the data
+combinedData=subset(combinedData,select = -c(2:12,14,15,20,23,26,31,33:36,45,62,63,69,79,81,83))
+
+#Implement the char2na function
+combinedData %>%
+  mutate_if(is.character, char2na) %>%
+  mutate_if(is.factor, char2na) -> combinedData
+
+#Drop columns based on percentage of missing values
+print(summary(combinedData))
+combinedData<-combinedData[,-which(names(combinedData)%in%c("square_feet","weekly_price","monthly_price","city","license"))]
+
+
+
+#Pre-processing of the Data
+#Date to Integers
+combinedData$host_since<-days(combinedData$host_since)
+combinedData$first_review<-days(combinedData$first_review)
+combinedData$last_review<-days(combinedData$last_review)
+
+#Factor
+combinedData$host_response_time<-as.factor(combinedData$host_response_time)
+
+#Make it number
+combinedData$host_response_rate<- as.numeric(gsub("[^\\d]", "", combinedData$host_response_rate, perl=TRUE))/100
+combinedData$host_acceptance_rate<- as.numeric(gsub("[^\\d]", "", combinedData$host_acceptance_rate, perl=TRUE))/100
+
+#Factor
+combinedData$host_is_superhost<-as.factor(combinedData$host_is_superhost)
+combinedData$host_has_profile_pic<-as.factor(combinedData$host_has_profile_pic)
+combinedData$host_identity_verified<-as.factor(combinedData$host_identity_verified)
+
+#Locations: Clean the text, make small categories as other
+combinedData$neighbourhood<-as.factor(clean_location(combinedData$neighbourhood))
+combinedData$neighbourhood <- fct_lump_min(combinedData$neighbourhood, min=10)
+combinedData$neighbourhood_cleansed<-as.factor(clean_location(combinedData$neighbourhood_cleansed))
+combinedData$neighbourhood_group_cleansed<-as.factor(clean_location(combinedData$neighbourhood_group_cleansed))
+
+#Zipcode
+combinedData$zipcode <- gsub("[^\\d]", "", combinedData$zipcode, perl=TRUE)
+combinedData$zipcode <- substr(combinedData$zipcode, 1, 5)
+combinedData$zipcode[nchar(combinedData$zipcode)<5] <- NA_character_
+combinedData$zipcode <- as.factor(combinedData$zipcode)
+combinedData$zipcode <- fct_lump_min(combinedData$zipcode, min=5)
+
+#Factor
+combinedData$is_location_exact<-as.factor((combinedData$is_location_exact))
+
+#Property type
+combinedData$property_type<-as.factor(clean_location(combinedData$property_type))
+combinedData$property_type <- fct_lump_min(combinedData$property_type, min=5)
+
+#Factor
+combinedData$room_type<-as.factor(clean_location(combinedData$room_type))
+combinedData$bed_type <- as.factor(combinedData$bed_type)
+combinedData$instant_bookable <- as.factor(combinedData$instant_bookable)
+combinedData$cancellation_policy <- as.factor(combinedData$cancellation_policy)
+combinedData$require_guest_profile_picture <- as.factor(combinedData$require_guest_profile_picture)
+combinedData$require_guest_phone_verification <- as.factor(combinedData$require_guest_phone_verification)
+
+#Missing Data - Putting the median value in missing numerical values
+library(caret)
+numeric_predictors <- which(colnames(combinedData) != "price" & 
+                              sapply(combinedData, is.numeric))
+imp_model_med <- preProcess(combinedData[,numeric_predictors],
+                            method = 'medianImpute')
+#imp_model_bag <- preProcess(combinedData[,-which(names(combinedData)%in%c("price"))], 
+#                            method = 'bagImpute')
+set.seed(617)
+combinedData[,numeric_predictors] <- predict(imp_model_med,
+                                             newdata=combinedData[,numeric_predictors])
+combinedData$zipcode[is.na(combinedData$zipcode)]<-"Other"
+combinedData$neighbourhood[is.na(combinedData$neighbourhood)]<-"Other"
+
+#Split the data
+data <- combinedData[!is.na(combinedData$price),]
+scoringData <- combinedData[is.na(combinedData$price),]
+
+#Increase perfomance by activating all cpu
+library(parallel)
+library(parallelMap) 
+parallelStartSocket(cpus = detectCores())
+
+#Xgboost
+library(xgboost)
+train_x = data.matrix(data[,-which(names(data)%in%c("price"))])
+train_y = data$price
+dtrain = xgb.DMatrix(data = train_x, label = train_y)
+xgboost = xgboost(data=train_x, 
+                  label = train_y,
+                  nrounds=10000,
+                  verbose = 0,
+                  early_stopping_rounds = 100)
+xgboost$best_iteration
+
+dtest=data.matrix(scoringData[,-which(names(scoringData)%in%c("price"))])
+pred <- predict(xgboost, newdata=dtest)
+
+submissionFile = data.frame(id=scoringData$id, price=pred)
+write.csv(submissionFile, 'xgboost_3.csv', row.names=FALSE)
+
+
+
+
+#RANDOM FOREST
+library(gbm)
+set.seed(617)
+
+boost = gbm(price~.-id,
+            data=data,
+            distribution="gaussian",
+            n.trees = 10000,
+            interaction.depth = 2,
+            shrinkage = 0.01)
+pred <- predict(boost, scoringData)
+
+
+#Combination of Xgboost and Random Forest 
+submissionfil= data.frame(id=scoringData$id, price=pred2/2+pred3/2)
+write.cvs(submissionfile,"combination.cvs",row.names=FALSE)
+
+
